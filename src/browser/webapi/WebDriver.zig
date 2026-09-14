@@ -331,6 +331,11 @@ fn performPointerSource(source: js.Object, frame: *Frame) !void {
                         _ = dispatchMouse(click_target, "dblclick", button, 0, click_count, frame);
                     }
                 } else {
+                    // Unlike triggerMousePress/Release's CDP/BiDi path,
+                    // this still fires contextmenu on release, not press,
+                    // and doesn't invalidate a chord's ending click count —
+                    // a deliberate non-unification, same as leaving this
+                    // function's own tracking/error philosophy alone.
                     if (button == 2) {
                         _ = dispatchMouse(click_target, "contextmenu", button, 0, click_count, frame);
                     }

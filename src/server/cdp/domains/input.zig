@@ -477,7 +477,8 @@ test "cdp.input: dispatchMouseEvent right button fires contextmenu, double-click
     const rect_x = try (try ls.local.compileAndRun("document.getElementById('hoverTarget').getBoundingClientRect().x", null)).toF64();
     const rect_y = try (try ls.local.compileAndRun("document.getElementById('hoverTarget').getBoundingClientRect().y", null)).toF64();
 
-    // Right button: press carries button=2, release fires contextmenu (not click).
+    // Right button: press carries button=2 and fires contextmenu itself
+    // (not on release, and not click).
     try ctx.processMessage(.{
         .id = 1,
         .method = "Input.dispatchMouseEvent",
@@ -497,6 +498,111 @@ test "cdp.input: dispatchMouseEvent right button fires contextmenu, double-click
     });
 
     const result = try ls.local.compileAndRun("window.downButton === 2 && window.ctxButton === 2 && window.dbl === true", null);
+    try testing.expect(result.isTrue());
+}
+
+// clickCount 0 on release (CDP's own default, not a chord-invalidated one)
+// skips click and preserves mouseup's detail at 0 rather than forcing 1
+// (matches Chrome; BiDi never sends 0, so this path is CDP-only in
+// practice).
+test "cdp.input: dispatchMouseEvent mouseReleased with clickCount 0 fires no click and preserves mouseup's detail" {
+    var ctx = try testing.context();
+    defer ctx.deinit();
+
+    const bc = try ctx.loadBrowserContext(.{});
+    const page = try bc.session.createPage();
+    const frame = page.frame().?;
+
+    const url = "http://localhost:9582/src/browser/tests/mcp_actions.html";
+    try frame.navigate(url, .{ .reason = .address_bar, .kind = .{ .push = null } });
+    try testing.waitForPage(bc);
+
+    var ls: lp.js.Local.Scope = undefined;
+    frame.js.localScope(&ls);
+    defer ls.deinit();
+
+    var try_catch: lp.js.TryCatch = undefined;
+    try_catch.init(&ls.local);
+    defer try_catch.deinit();
+
+    const rect_x = try (try ls.local.compileAndRun("document.getElementById('btn').getBoundingClientRect().x", null)).toF64();
+    const rect_y = try (try ls.local.compileAndRun("document.getElementById('btn').getBoundingClientRect().y", null)).toF64();
+
+    try ctx.processMessage(.{
+        .id = 1,
+        .method = "Input.dispatchMouseEvent",
+        .params = .{ .type = "mousePressed", .x = rect_x, .y = rect_y, .button = "left" },
+    });
+    try ctx.processMessage(.{
+        .id = 2,
+        .method = "Input.dispatchMouseEvent",
+        .params = .{ .type = "mouseReleased", .x = rect_x, .y = rect_y, .button = "left" },
+    });
+
+    const result = try ls.local.compileAndRun(
+        \\JSON.stringify(window.seq) === JSON.stringify([
+        \\  'pointerdown:0:1:0:mouse:true', 'mousedown:0:1:0::true',
+        \\  'pointerup:0:0:0:mouse:true', 'mouseup:0:0:0::true'
+        \\])
+    , null);
+    try testing.expect(result.isTrue());
+}
+
+// The middle (auxiliary) button fires auxclick on its own release, gated by
+// clickCount the same way the primary button's click is (matches Chrome).
+test "cdp.input: dispatchMouseEvent middle button fires auxclick, suppressed at clickCount 0" {
+    var ctx = try testing.context();
+    defer ctx.deinit();
+
+    const bc = try ctx.loadBrowserContext(.{});
+    const page = try bc.session.createPage();
+    const frame = page.frame().?;
+
+    const url = "http://localhost:9582/src/browser/tests/mcp_actions.html";
+    try frame.navigate(url, .{ .reason = .address_bar, .kind = .{ .push = null } });
+    try testing.waitForPage(bc);
+
+    var ls: lp.js.Local.Scope = undefined;
+    frame.js.localScope(&ls);
+    defer ls.deinit();
+
+    var try_catch: lp.js.TryCatch = undefined;
+    try_catch.init(&ls.local);
+    defer try_catch.deinit();
+
+    _ = try ls.local.compileAndRun(
+        \\window.auxSeen = [];
+        \\document.getElementById('hoverTarget').addEventListener('auxclick', (e) => { window.auxSeen.push(e.button); });
+    , null);
+
+    const rect_x = try (try ls.local.compileAndRun("document.getElementById('hoverTarget').getBoundingClientRect().x", null)).toF64();
+    const rect_y = try (try ls.local.compileAndRun("document.getElementById('hoverTarget').getBoundingClientRect().y", null)).toF64();
+
+    // clickCount 0 (omitted): no auxclick.
+    try ctx.processMessage(.{
+        .id = 1,
+        .method = "Input.dispatchMouseEvent",
+        .params = .{ .type = "mousePressed", .x = rect_x, .y = rect_y, .button = "middle" },
+    });
+    try ctx.processMessage(.{
+        .id = 2,
+        .method = "Input.dispatchMouseEvent",
+        .params = .{ .type = "mouseReleased", .x = rect_x, .y = rect_y, .button = "middle" },
+    });
+
+    // clickCount 1: auxclick fires.
+    try ctx.processMessage(.{
+        .id = 3,
+        .method = "Input.dispatchMouseEvent",
+        .params = .{ .type = "mousePressed", .x = rect_x, .y = rect_y, .button = "middle", .clickCount = 1 },
+    });
+    try ctx.processMessage(.{
+        .id = 4,
+        .method = "Input.dispatchMouseEvent",
+        .params = .{ .type = "mouseReleased", .x = rect_x, .y = rect_y, .button = "middle", .clickCount = 1 },
+    });
+
+    const result = try ls.local.compileAndRun("JSON.stringify(window.auxSeen) === JSON.stringify([1])", null);
     try testing.expect(result.isTrue());
 }
 
@@ -728,9 +834,12 @@ test "cdp.input: a cancelled pointerdown suppresses mousedown and mouseup across
     try testing.expect(result.isTrue());
 }
 
-// Asserts only the pointer events: pointerdown/pointerup fire at the mask's
-// 0/nonzero transitions and a mid-gesture button change is a pointermove (the
-// activation order below is a pre-existing, non-spec deviation from Chrome).
+// pointerdown/pointerup fire at the mask's 0/nonzero transitions and a
+// mid-gesture button change is a pointermove. Activation order confirmed
+// against Chrome: contextmenu fires on the right button's own press, its
+// mid-gesture release (left still held) fires auxclick, and left — ending a
+// gesture that was a chord — gets no click at all (its click count is
+// invalidated; see triggerMouseRelease).
 test "cdp.input: a mouse chord fires pointermove for the mid-gesture button change, not a second pointerdown/pointerup" {
     var ctx = try testing.context();
     defer ctx.deinit();
@@ -777,14 +886,16 @@ test "cdp.input: a mouse chord fires pointermove for the mid-gesture button chan
 
     const result = try ls.local.compileAndRun(
         \\JSON.stringify(window.seqChord) === JSON.stringify([
-        \\  'pointerdown:1', 'pointermove:3', 'pointermove:1', 'contextmenu:1', 'pointerup:0', 'click:0'
+        \\  'pointerdown:1', 'pointermove:3', 'contextmenu:3', 'pointermove:1', 'auxclick:1', 'pointerup:0'
         \\])
     , null);
     try testing.expect(result.isTrue());
 }
 
 // A primary release mid-chord reports the still-held mask on its click, not 0
-// (confirmed against Chrome and Firefox).
+// (confirmed against Chrome and Firefox). The chord's other button (right)
+// ends the gesture here, so its own click count is invalidated: contextmenu
+// still fires on its press as always, but no auxclick on its release.
 test "cdp.input: a primary click fired mid-chord carries the still-held buttons mask" {
     var ctx = try testing.context();
     defer ctx.deinit();
@@ -832,7 +943,69 @@ test "cdp.input: a primary click fired mid-chord carries the still-held buttons 
 
     const result = try ls.local.compileAndRun(
         \\JSON.stringify(window.seqChord) === JSON.stringify([
-        \\  'pointerdown:1', 'pointermove:3', 'pointermove:2', 'click:2', 'pointerup:0', 'contextmenu:0'
+        \\  'pointerdown:1', 'pointermove:3', 'contextmenu:3', 'pointermove:2', 'click:2', 'pointerup:0'
+        \\])
+    , null);
+    try testing.expect(result.isTrue());
+}
+
+// Pins the surprising half of the invalidation rule: an explicit clickCount
+// on the button that ends a chorded gesture is still overridden to 0 by
+// Chrome, not just an omitted/0 one — confirmed live even with clickCount:2
+// on that final release. Uses #btn (unlike btnChord, its pointerdown is
+// never cancelled) so mouseup's own detail is actually observable, not
+// suppressed for the whole gesture.
+test "cdp.input: an explicit clickCount is still invalidated on the button that ends a chorded gesture" {
+    var ctx = try testing.context();
+    defer ctx.deinit();
+
+    const bc = try ctx.loadBrowserContext(.{});
+    const page = try bc.session.createPage();
+    const frame = page.frame().?;
+
+    const url = "http://localhost:9582/src/browser/tests/mcp_actions.html";
+    try frame.navigate(url, .{ .reason = .address_bar, .kind = .{ .push = null } });
+    try testing.waitForPage(bc);
+
+    var ls: lp.js.Local.Scope = undefined;
+    frame.js.localScope(&ls);
+    defer ls.deinit();
+
+    var try_catch: lp.js.TryCatch = undefined;
+    try_catch.init(&ls.local);
+    defer try_catch.deinit();
+
+    const rect_x = try (try ls.local.compileAndRun("document.getElementById('btn').getBoundingClientRect().x", null)).toF64();
+    const rect_y = try (try ls.local.compileAndRun("document.getElementById('btn').getBoundingClientRect().y", null)).toF64();
+
+    // press-left, press-right (chord), release-right (mid-chord), release-left
+    // (ends the gesture) — clickCount 2 throughout.
+    try ctx.processMessage(.{
+        .id = 1,
+        .method = "Input.dispatchMouseEvent",
+        .params = .{ .type = "mousePressed", .x = rect_x, .y = rect_y, .button = "left", .clickCount = 2 },
+    });
+    try ctx.processMessage(.{
+        .id = 2,
+        .method = "Input.dispatchMouseEvent",
+        .params = .{ .type = "mousePressed", .x = rect_x, .y = rect_y, .button = "right", .clickCount = 2 },
+    });
+    try ctx.processMessage(.{
+        .id = 3,
+        .method = "Input.dispatchMouseEvent",
+        .params = .{ .type = "mouseReleased", .x = rect_x, .y = rect_y, .button = "right", .clickCount = 2 },
+    });
+    try ctx.processMessage(.{
+        .id = 4,
+        .method = "Input.dispatchMouseEvent",
+        .params = .{ .type = "mouseReleased", .x = rect_x, .y = rect_y, .button = "left", .clickCount = 2 },
+    });
+
+    const result = try ls.local.compileAndRun(
+        \\JSON.stringify(window.seq) === JSON.stringify([
+        \\  'pointerdown:0:1:0:mouse:true', 'mousedown:0:1:2::true',
+        \\  'mousedown:2:3:2::true', 'mouseup:2:1:2::true',
+        \\  'pointerup:0:0:0:mouse:true', 'mouseup:0:0:0::true'
         \\])
     , null);
     try testing.expect(result.isTrue());
