@@ -256,23 +256,38 @@ pub const PointerButtons = struct {
     /// Whether the gesture's opening pointerdown suppressed the compat mouse
     /// events; held for the whole gesture so each split message reads it here.
     mousedown_suppressed: bool = false,
+    /// Whether this gesture ever had more than one button held at once.
+    /// Chrome invalidates the click count of whichever button ends a
+    /// gesture that was, at some point, a chord — see triggerMouseRelease.
+    was_chord: bool = false,
 
     /// `starts_gesture` is false for a chorded press (another button held).
     pub fn press(self: *PointerButtons, button: i32) struct { starts_gesture: bool, held: u16 } {
         const bit = buttonsBitmask(button);
         const starts_gesture = self.held & ~bit == 0;
+        if (starts_gesture) {
+            self.was_chord = false;
+        } else {
+            self.was_chord = true;
+        }
         self.held |= bit;
         return .{ .starts_gesture = starts_gesture, .held = self.held };
     }
 
     /// `ends_gesture` is the last held button releasing, which clears the
-    /// suppression flag; `was_suppressed` is that flag for this gesture.
-    pub fn release(self: *PointerButtons, button: i32) struct { ends_gesture: bool, held: u16, was_suppressed: bool } {
+    /// suppression flag; `was_suppressed` is that flag for this gesture, and
+    /// `was_chord` is whether the gesture was ever a chord (read before the
+    /// ends_gesture reset, same as was_suppressed).
+    pub fn release(self: *PointerButtons, button: i32) struct { ends_gesture: bool, held: u16, was_suppressed: bool, was_chord: bool } {
         const was_suppressed = self.mousedown_suppressed;
+        const was_chord = self.was_chord;
         self.held &= ~buttonsBitmask(button);
         const ends_gesture = self.held == 0;
-        if (ends_gesture) self.mousedown_suppressed = false;
-        return .{ .ends_gesture = ends_gesture, .held = self.held, .was_suppressed = was_suppressed };
+        if (ends_gesture) {
+            self.mousedown_suppressed = false;
+            self.was_chord = false;
+        }
+        return .{ .ends_gesture = ends_gesture, .held = self.held, .was_suppressed = was_suppressed, .was_chord = was_chord };
     }
 
     /// Discards an in-progress gesture (a press/release that hit no element).
@@ -366,6 +381,15 @@ pub fn triggerMousePress(frame: *Frame, x: f64, y: f64, button: i32, click_count
             try runMouseDownFocus(frame, target, .{ .suppress_mouse = false, .suppress_focus = suppress_focus }, null);
         }
     }
+
+    // contextmenu fires on the secondary button's own press, not its
+    // release — confirmed live against both Chrome and Firefox (fresh
+    // press and chorded press alike) — and always carries detail 0,
+    // unaffected by click_count (unlike mousedown/click/auxclick); the
+    // detail-0 half is confirmed against Chrome only.
+    if (button == mouse_button.secondary) {
+        _ = try dispatchMouseEventOn(frame, target, "contextmenu", .{ .x = x, .y = y, .button = button, .buttons = gesture.held });
+    }
 }
 
 pub fn triggerMouseMove(frame: *Frame, x: f64, y: f64) !void {
@@ -399,6 +423,15 @@ pub fn triggerMouseRelease(frame: *Frame, x: f64, y: f64, button: i32, click_cou
     const remaining = gesture.held;
     const ends_gesture = gesture.ends_gesture;
     const was_suppressed = gesture.was_suppressed;
+    // Chrome invalidates the click count of whichever button ends a
+    // gesture that was, at some point, a chord — confirmed live: even an
+    // explicit clickCount:2 on that final release comes back mouseup
+    // detail 0, no click/dblclick/auxclick. A non-chorded gesture's sole
+    // release is unaffected. Firefox instead still fires auxclick on a
+    // chord's final non-primary release; this follows Chrome, since this
+    // function's CDP caller is literally Chrome's own protocol — the BiDi
+    // path inherits the same choice.
+    const effective_click_count: i32 = if (ends_gesture and gesture.was_chord) 0 else click_count;
 
     const target = (try frame.window._document.elementFromPoint(x, y, frame)) orelse return;
     if (comptime lp.IS_DEBUG) {
@@ -412,7 +445,12 @@ pub fn triggerMouseRelease(frame: *Frame, x: f64, y: f64, button: i32, click_cou
         });
     }
 
-    const detail: u32 = if (click_count > 0) @intCast(click_count) else 1;
+    // As on the press side: an invalidated or omitted/zero click count
+    // preserves detail 0 rather than forcing 1 — matching Chrome, which
+    // fires mouseup (and no click/auxclick at all) in that case. Confirmed
+    // against Chrome only: BiDi's own click_count tracking never sends 0,
+    // so this path is CDP-only in practice.
+    const detail: u32 = if (effective_click_count > 0) @intCast(effective_click_count) else 0;
 
     if (ends_gesture) {
         try dispatchPointerRelease(frame, target, x, y, button, was_suppressed, detail, .{});
@@ -425,18 +463,22 @@ pub fn triggerMouseRelease(frame: *Frame, x: f64, y: f64, button: i32, click_cou
         }
     }
 
-    // After mouseup, the activation event depends on the button.
-    switch (button) {
-        mouse_button.main => {
-            try dispatchClickAsPointer(frame, target, x, y, detail, remaining, .{});
-            // A second click in quick succession also fires dblclick.
-            if (click_count == 2) {
-                _ = try dispatchMouseEventOn(frame, target, "dblclick", .{ .x = x, .y = y, .button = button, .buttons = remaining, .detail = detail });
-            }
-        },
-        mouse_button.auxiliary => _ = try dispatchMouseEventOn(frame, target, "auxclick", .{ .x = x, .y = y, .button = button, .buttons = remaining, .detail = detail }),
-        mouse_button.secondary => _ = try dispatchMouseEventOn(frame, target, "contextmenu", .{ .x = x, .y = y, .button = button, .buttons = remaining, .detail = detail }),
-        else => {},
+    // After mouseup, the activation event depends on the button — unless
+    // this release's click count was invalidated above, in which case none
+    // fires. contextmenu is not here: it fires on the secondary button's
+    // own press instead (triggerMousePress), unconditional on click count.
+    if (effective_click_count > 0) {
+        switch (button) {
+            mouse_button.main => {
+                try dispatchClickAsPointer(frame, target, x, y, detail, remaining, .{});
+                // A second click in quick succession also fires dblclick.
+                if (effective_click_count == 2) {
+                    _ = try dispatchMouseEventOn(frame, target, "dblclick", .{ .x = x, .y = y, .button = button, .buttons = remaining, .detail = detail });
+                }
+            },
+            mouse_button.auxiliary, mouse_button.secondary => _ = try dispatchMouseEventOn(frame, target, "auxclick", .{ .x = x, .y = y, .button = button, .buttons = remaining, .detail = detail }),
+            else => {},
+        }
     }
 }
 
