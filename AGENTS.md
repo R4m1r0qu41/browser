@@ -22,10 +22,11 @@ The custom test runner (`src/test_runner.zig`) detects memory leaks in debug bui
 ## Formatting
 
 ```bash
-zig fmt --check ./*.zig ./**/*.zig    # Exact command CI runs
+zig fmt --check ./    # Exact command CI runs
+zig build fmt         # Covers src, build.zig and build.zig.zon only
 ```
 
-`zig build` depends on the fmt step, so a local build catches drift too.
+In a checkout with fetched dependencies, `./` also walks `zig-pkg/` and reports their files; use `zig build fmt` locally. `zig build` depends on the fmt step, so a local build catches drift too.
 
 ## Conventions
 
