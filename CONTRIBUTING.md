@@ -5,7 +5,11 @@ Lightpanda accepts pull requests through GitHub.
 ## Development
 
 - Run the tests: `make test`
-- Check formatting: `zig fmt --check ./*.zig ./**/*.zig`
+- Check formatting locally: `zig build fmt` and `zig fmt --check orderfile/mark_hot_sections.zig`.
+
+CI runs `zig fmt --check ./`. In a checkout with fetched dependencies, this
+also scans the ignored `zig-pkg/` directory and can report formatting errors
+in dependency files.
 
 See [AGENTS.md](AGENTS.md) for the full set of test, formatting, and code conventions (test filters, the leak-detection invariant, `@import` alias case, struct-init inference).
 
@@ -22,7 +26,7 @@ build instead.
 ## Before opening a PR
 
 - [ ] Tests pass (`make test`).
-- [ ] Formatting is clean (`zig fmt --check ./*.zig ./**/*.zig`).
+- [ ] Formatting is clean (`zig build fmt` and `zig fmt --check orderfile/mark_hot_sections.zig`).
 - [ ] CLA signed (see below).
 
 ## CLA
